@@ -52,7 +52,7 @@ struct BinFile {
 
 impl BinFile {
     fn new(filepath: PathBuf) -> io::Result<BinFile> {
-        let size = fs::File::open(&filepath)?.metadata()?.len();
+        let size = fs::metadata(&filepath)?.len(); // Performance hit
 
         Ok(BinFile {
             filename: filepath.to_str().unwrap().to_string(),
@@ -179,6 +179,15 @@ fn get_bin_from_cue(cue_path : &str) -> io::Result<Vec<BinFile>> {
 }
 
 fn get_cd_from_cue(cue_path : &str) -> io::Result<CD> {
+    println!("Cue path: {}", cue_path);
+    match Path::new(cue_path).exists() {
+        true => println!("Cue file exists!"),
+        false => {
+            eprintln!("Cue file does not exist!");
+            return Ok(CD::parse("".to_string()).unwrap());
+        }
+        
+    }
     let cue_file = File::open(cue_path)?;
     // Read cue file and store it in a single string variable
     let mut cue_contents = String::new();
@@ -260,12 +269,12 @@ fn files(dir: &Path) -> Result<Vec<PathBuf>, io::Error> {
 
 fn main() {
     // ---- Read Cue File tests ----
-    let path = Path::new("D:\\Downloads\\binmergetests\\Mortal Kombat 3 (USA)");
+    let path = Path::new("/mnt/d/Downloads/binmergetests/Mortal Kombat 3 (USA)");
     // Find cue file by its extension
     let start = Instant::now();
     let cue_path = path.join(path.file_name().unwrap()).with_extension("cue");
-    //let bin_files = get_bin_from_cue(cue_path.to_str().unwrap());
-    let _ = get_cd_from_cue(cue_path.to_str().unwrap());
+    let bin_files = get_bin_from_cue(cue_path.to_str().unwrap());
+    //let _ = get_cd_from_cue(cue_path.to_str().unwrap());
     let duration = start.elapsed();
 
     // Print bin files
