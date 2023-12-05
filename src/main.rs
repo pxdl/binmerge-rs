@@ -3,11 +3,19 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write, BufRead};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
+use lazy_static::lazy_static;
 
 use rcue::parser::parse_from_file;
 use rcue::parser::parse;
 
 use regex::Regex;
+
+lazy_static! {
+    static ref FILE_PATTERN: Regex = Regex::new(r#"FILE "(.*?)" BINARY"#).unwrap();
+    static ref TRACK_PATTERN: Regex = Regex::new(r#"TRACK (\d+) ([^\s]*)"#).unwrap();
+    static ref INDEX_PATTERN: Regex = Regex::new(r#"INDEX (\d+) (\d+:\d+:\d+)"#).unwrap();
+    static ref CUESTAMP_PATTERN: Regex = Regex::new(r"(\d+):(\d+):(\d+)").unwrap();
+}
 
 struct Index {
     id: u32,
@@ -63,13 +71,12 @@ impl BinFile {
     }
 }
 
-fn cuestamp_to_sectors(timestamp: &str, cuestamp_pattern: &Regex) -> Result<u32, &'static str> {
-    //let re = Regex::new(r"(\d+):(\d+):(\d+)").map_err(|_| "Regex compilation failed")?;
+fn cuestamp_to_sectors(timestamp: &str) -> Result<u32, &'static str> {
     let start_cuestamp = Instant::now();
 
     let duration_cuestamp = start_cuestamp.elapsed();
 
-    if let Some(caps) = cuestamp_pattern.captures(&timestamp) {
+    if let Some(caps) = CUESTAMP_PATTERN.captures(&timestamp) {
         let minutes = caps.get(1).ok_or("Invalid timestamp")?.as_str().parse::<u32>().map_err(|_| "Invalid minutes")?;
         let seconds = caps.get(2).ok_or("Invalid timestamp")?.as_str().parse::<u32>().map_err(|_| "Invalid seconds")?;
         let frames = caps.get(3).ok_or("Invalid timestamp")?.as_str().parse::<u32>().map_err(|_| "Invalid frames")?;
@@ -109,11 +116,6 @@ fn get_bin_from_cue(cue_path : &str) -> io::Result<Vec<BinFile>> {
 
     let mut missing_bin_file = false;
 
-    let file_pattern = Regex::new(r#"FILE "(.*?)" BINARY"#).unwrap();
-    let track_pattern = Regex::new(r#"TRACK (\d+) ([^\s]*)"#).unwrap();
-    let index_pattern = Regex::new(r#"INDEX (\d+) (\d+:\d+:\d+)"#).unwrap();
-    let cuestamp_pattern = Regex::new(r"(\d+):(\d+):(\d+)").unwrap();
-
     let cue_file = File::open(cue_path)?;
     let reader = io::BufReader::new(cue_file);
 
@@ -127,7 +129,7 @@ fn get_bin_from_cue(cue_path : &str) -> io::Result<Vec<BinFile>> {
         let line = line?;
 
         // Process file lines
-        if let Some(caps) = file_pattern.captures(&line) {
+        if let Some(caps) = FILE_PATTERN.captures(&line) {
             let start_bin_file = Instant::now();
             
             if let Some(bin) = caps.get(1) {
@@ -147,7 +149,7 @@ fn get_bin_from_cue(cue_path : &str) -> io::Result<Vec<BinFile>> {
             }
         }
         // Process track lines
-        if let Some(caps) = track_pattern.captures(&line) {
+        if let Some(caps) = TRACK_PATTERN.captures(&line) {
             let start_track = Instant::now();
 
             if let (Some(track_number_match), Some(track_type_match)) = (caps.get(1), caps.get(2)) {
@@ -168,12 +170,12 @@ fn get_bin_from_cue(cue_path : &str) -> io::Result<Vec<BinFile>> {
             }
         }
         // Process index lines
-        if let Some(caps) = index_pattern.captures(&line) {
+        if let Some(caps) = INDEX_PATTERN.captures(&line) {
             if let (Some(index_number_match), Some(timestamp_match)) = (caps.get(1), caps.get(2)) {
                 let index_number = index_number_match.as_str().parse::<u32>().unwrap();
                 let timestamp = timestamp_match.as_str().to_string();
                 //let start_index = Instant::now();
-                let file_offset = cuestamp_to_sectors(&timestamp, &cuestamp_pattern).unwrap(); // Convert timestamp to sectors
+                let file_offset = cuestamp_to_sectors(&timestamp).unwrap(); // Convert timestamp to sectors
                 //let duration_index = start_index.elapsed();
 
                 if let Some(file_index) = current_file_index {
@@ -306,10 +308,10 @@ fn main() {
     let duration = start.elapsed();
 
     // Print bin files
-    // match bin_files {
-    //     Ok(bin_files) => print_bin_files(&bin_files),
-    //     Err(e) => println!("Error: {}", e),
-    // }
+    match bin_files {
+        Ok(bin_files) => print_bin_files(&bin_files),
+        Err(e) => println!("Error: {}", e),
+    }
 
     println!("Time elapsed in files() is: {:?}", duration);
 
