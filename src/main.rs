@@ -1,10 +1,11 @@
+use std::error;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write, BufRead};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use cue::cd::{CD, DiscMode};
-use cue::track::{TrackMode, TrackSubMode};
+use rcue::parser::parse_from_file;
+use rcue::parser::parse;
 
 use regex::Regex;
 
@@ -62,13 +63,18 @@ impl BinFile {
     }
 }
 
-fn cuestamp_to_sectors(timestamp: &str) -> Result<u32, &'static str> {
-    let re = Regex::new(r"(\d+):(\d+):(\d+)").map_err(|_| "Regex compilation failed")?;
-    if let Some(caps) = re.captures(timestamp) {
+fn cuestamp_to_sectors(timestamp: &str, cuestamp_pattern: &Regex) -> Result<u32, &'static str> {
+    //let re = Regex::new(r"(\d+):(\d+):(\d+)").map_err(|_| "Regex compilation failed")?;
+    let start_cuestamp = Instant::now();
+
+    let duration_cuestamp = start_cuestamp.elapsed();
+
+    if let Some(caps) = cuestamp_pattern.captures(&timestamp) {
         let minutes = caps.get(1).ok_or("Invalid timestamp")?.as_str().parse::<u32>().map_err(|_| "Invalid minutes")?;
         let seconds = caps.get(2).ok_or("Invalid timestamp")?.as_str().parse::<u32>().map_err(|_| "Invalid seconds")?;
         let frames = caps.get(3).ok_or("Invalid timestamp")?.as_str().parse::<u32>().map_err(|_| "Invalid frames")?;
-
+        
+        println!("Time elapsed in cuestamp_to_sectors() is: {:?}", duration_cuestamp);
         Ok(frames + (seconds * 75) + (minutes * 60 * 75))
     } else {
         Err("Timestamp does not match pattern")
@@ -106,23 +112,34 @@ fn get_bin_from_cue(cue_path : &str) -> io::Result<Vec<BinFile>> {
     let file_pattern = Regex::new(r#"FILE "(.*?)" BINARY"#).unwrap();
     let track_pattern = Regex::new(r#"TRACK (\d+) ([^\s]*)"#).unwrap();
     let index_pattern = Regex::new(r#"INDEX (\d+) (\d+:\d+:\d+)"#).unwrap();
+    let cuestamp_pattern = Regex::new(r"(\d+):(\d+):(\d+)").unwrap();
 
     let cue_file = File::open(cue_path)?;
     let reader = io::BufReader::new(cue_file);
 
     let start = Instant::now();
+
+    let mut current_file_index: Option<usize> = None;
+    let mut current_track_index: Option<usize> = None;
+    let mut current_index_index : Option<usize> = None;
+    
     for line in reader.lines() {
         let line = line?;
 
         // Process file lines
         if let Some(caps) = file_pattern.captures(&line) {
             let start_bin_file = Instant::now();
+            
             if let Some(bin) = caps.get(1) {
                 let bin_file_path = Path::new(cue_path).parent().unwrap().join(bin.as_str());
                 //let bin_file = File::open(bin_file_path);
                 //println!("Bin file: {}", bin_file_path.to_str().unwrap());
                 let current_bin_file = BinFile::new(bin_file_path).unwrap();
                 bin_files.push(current_bin_file);
+                current_file_index = Some(bin_files.len() - 1);
+                current_track_index = None;
+                current_index_index = None;
+
                 let duration_bin_file = start_bin_file.elapsed();
                 println!("Time elapsed in BinFile::new() is: {:?}", duration_bin_file);
 
@@ -132,35 +149,41 @@ fn get_bin_from_cue(cue_path : &str) -> io::Result<Vec<BinFile>> {
         // Process track lines
         if let Some(caps) = track_pattern.captures(&line) {
             let start_track = Instant::now();
+
             if let (Some(track_number_match), Some(track_type_match)) = (caps.get(1), caps.get(2)) {
                 let track_number = track_number_match.as_str().parse::<u32>().unwrap();
                 let track_type = track_type_match.as_str().to_string();
 
-                if let Some(last_file) = bin_files.last_mut() {
+                if let Some(file_index) = current_file_index {
                     let current_track = Track::new(track_number, track_type);
-                    last_file.tracks.push(current_track);
+                    bin_files[file_index].tracks.push(current_track);
+                    current_track_index = Some(bin_files[file_index].tracks.len() - 1);
+                    current_index_index = None;
                 }
+
                 let duration_tracks = start_track.elapsed();
                 println!("Time elapsed in Track::new() is: {:?}", duration_tracks);
+
                 continue;
             }
         }
         // Process index lines
         if let Some(caps) = index_pattern.captures(&line) {
-            let start_index = Instant::now();
             if let (Some(index_number_match), Some(timestamp_match)) = (caps.get(1), caps.get(2)) {
                 let index_number = index_number_match.as_str().parse::<u32>().unwrap();
                 let timestamp = timestamp_match.as_str().to_string();
-                let file_offset = cuestamp_to_sectors(&timestamp).unwrap(); // Convert timestamp to sectors
-                
-                if let Some(last_file) = bin_files.last_mut() {
-                    if let Some(last_track) = last_file.tracks.last_mut() {
+                //let start_index = Instant::now();
+                let file_offset = cuestamp_to_sectors(&timestamp, &cuestamp_pattern).unwrap(); // Convert timestamp to sectors
+                //let duration_index = start_index.elapsed();
+
+                if let Some(file_index) = current_file_index {
+                    if let Some(track_index) = current_track_index {
                         let current_index = Index::new(index_number, timestamp, file_offset);
-                        last_track.indexes.push(current_index); // Modify the last Track in the last BinFile
+                        bin_files[file_index].tracks[track_index].indexes.push(current_index);
+                        current_index_index = Some(bin_files[file_index].tracks[track_index].indexes.len() - 1);
                     }
                 }
-                let duration_index = start_index.elapsed();
-                println!("Time elapsed in Index::new() is: {:?}", duration_index);
+                //println!("Time elapsed in Index::new() is: {:?}", duration_index);
 
                 continue;
             }
@@ -178,42 +201,47 @@ fn get_bin_from_cue(cue_path : &str) -> io::Result<Vec<BinFile>> {
     Ok(bin_files)
 }
 
-fn get_cd_from_cue(cue_path : &str) -> io::Result<CD> {
+fn get_cd_from_cue(cue_path : &str) -> io::Result<rcue::cue::Cue> {
     println!("Cue path: {}", cue_path);
     match Path::new(cue_path).exists() {
         true => println!("Cue file exists!"),
         false => {
             eprintln!("Cue file does not exist!");
-            return Ok(CD::parse("".to_string()).unwrap());
+            //return Ok(CD::parse("".to_string()).unwrap());
         }
         
     }
-    let cue_file = File::open(cue_path)?;
-    // Read cue file and store it in a single string variable
-    let mut cue_contents = String::new();
-    let mut reader = io::BufReader::new(cue_file);
-    reader.read_to_string(&mut cue_contents)?;
+    let cd = parse_from_file(cue_path, true).unwrap();
+    println!("CD: {:?}", cd);
+    println!("CD Title: {:?}", cd.title);
 
-    let cd = CD::parse(cue_contents.to_string()).unwrap();
 
-    println!("Number of tracks: {}", cd.get_track_count());
-    let mode = match cd.get_mode() {
-        DiscMode::CD_DA => "CD-DA",
-        DiscMode::CD_ROM => "CD-ROM",
-        DiscMode::CD_ROM_XA => "CD-ROM XA",
-    };
-    println!("Mode: {}", mode);
-    println!("");
+    // let cue_file = File::open(cue_path)?;
+    // // Read cue file and store it in a single string variable
+    // let mut cue_contents = String::new();
+    // let mut reader = io::BufReader::new(cue_file);
+    // reader.read_to_string(&mut cue_contents)?;
 
-    for (index, track) in cd.tracks().iter().enumerate() {
-        println!("Track {}", index + 1);
-        println!("Filename: {}", track.get_filename());
-        println!("Start: {}", track.get_start());
-        println!("Length: {:?}", track.get_length());
-        println!("Pregap: {:?}", track.get_zero_pre());
-        println!("Postgap: {:?}", track.get_zero_post());
-        println!("");
-    }
+    // let cd = CD::parse(cue_contents.to_string()).unwrap();
+
+    // println!("Number of tracks: {}", cd.get_track_count());
+    // let mode = match cd.get_mode() {
+    //     DiscMode::CD_DA => "CD-DA",
+    //     DiscMode::CD_ROM => "CD-ROM",
+    //     DiscMode::CD_ROM_XA => "CD-ROM XA",
+    // };
+    // println!("Mode: {}", mode);
+    // println!("");
+
+    // for (index, track) in cd.tracks().iter().enumerate() {
+    //     println!("Track {}", index + 1);
+    //     println!("Filename: {}", track.get_filename());
+    //     println!("Start: {}", track.get_start());
+    //     println!("Length: {:?}", track.get_length());
+    //     println!("Pregap: {:?}", track.get_zero_pre());
+    //     println!("Postgap: {:?}", track.get_zero_post());
+    //     println!("");
+    // }
 
     Ok(cd)
 }
@@ -269,7 +297,7 @@ fn files(dir: &Path) -> Result<Vec<PathBuf>, io::Error> {
 
 fn main() {
     // ---- Read Cue File tests ----
-    let path = Path::new("/mnt/d/Downloads/binmergetests/Mortal Kombat 3 (USA)");
+    let path = Path::new("D:\\Downloads\\binmergetests\\Mortal Kombat 3 (USA)");
     // Find cue file by its extension
     let start = Instant::now();
     let cue_path = path.join(path.file_name().unwrap()).with_extension("cue");
