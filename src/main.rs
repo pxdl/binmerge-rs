@@ -1,351 +1,463 @@
-use std::error;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Read, Write, BufRead};
+use std::io::{self, BufRead, Read, Seek, Write};
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
-use lazy_static::lazy_static;
+use std::sync::LazyLock;
+use std::time::Instant;
 
-use rcue::parser::parse_from_file;
-use rcue::parser::parse;
-
+use clap::Parser;
 use regex::Regex;
 
-lazy_static! {
-    static ref FILE_PATTERN: Regex = Regex::new(r#"FILE "(.*?)" BINARY"#).unwrap();
-    static ref TRACK_PATTERN: Regex = Regex::new(r#"TRACK (\d+) ([^\s]*)"#).unwrap();
-    static ref INDEX_PATTERN: Regex = Regex::new(r#"INDEX (\d+) (\d+:\d+:\d+)"#).unwrap();
-    static ref CUESTAMP_PATTERN: Regex = Regex::new(r"(\d+):(\d+):(\d+)").unwrap();
-}
+// ─────────────────────────── Regex patterns ───────────────────────────
+
+static FILE_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r#"FILE "?(.*?)"? BINARY"#).unwrap());
+static TRACK_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"TRACK (\d+) ([^\s]*)").unwrap());
+static INDEX_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"INDEX (\d+) (\d+:\d+:\d+)").unwrap());
+static CUESTAMP_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(\d+):(\d+):(\d+)").unwrap());
+
+const BUF_SIZE: usize = 1024 * 1024; // 1 MiB
+
+// ─────────────────────────── Data structures ──────────────────────────
 
 struct Index {
-    id: u32,
-    stamp: String,
-    file_offset: u32, // Assuming cuestamp_to_sectors returns an i32
+    number: u32,
+    /// Sector offset from the start of the bin file containing this index.
+    file_offset: u32,
 }
-
-impl Index {
-    fn new(id: u32, stamp: String, file_offset: u32) -> Index {
-        Index {
-            id,
-            stamp,
-            file_offset,
-        }
-    }
-}
-
 struct Track {
-    num: u32,
-    indexes: Vec<Index>,
+    number: u32,
     track_type: String,
+    indexes: Vec<Index>,
+    /// Track length in sectors (populated for single-file / split mode).
     sectors: Option<u32>,
-    file_offset: Option<u32>,
 }
-
-impl Track {
-    fn new(num: u32, track_type: String) -> Track {
-        Track {
-            num,
-            indexes: Vec::new(),
-            track_type,
-            sectors: None,
-            file_offset: None,
-        }
-    }
-}
-
 struct BinFile {
     filename: String,
     tracks: Vec<Track>,
-    size: Option<u64>,
+    /// File size in bytes.
+    size: u64,
 }
 
-impl BinFile {
-    fn new(filepath: PathBuf) -> io::Result<BinFile> {
-        let size = fs::metadata(&filepath)?.len(); // Performance hit
+// ──────────────────────── CLI ─────────────────────────────────────────
 
-        Ok(BinFile {
-            filename: filepath.to_str().unwrap().to_string(),
-            tracks: Vec::new(),
-            size: Some(size),
-        })
+#[derive(Parser)]
+#[command(
+    name = "binmerge-rs",
+    about = "Merge multi-bin CUE sheets into a single bin/cue pair (or split them back)."
+)]
+struct Args {
+    /// Path to the .cue file
+    cuefile: String,
+
+    /// Base name (without extension) for the output .bin/.cue files
+    basename: String,
+
+    /// Reverse: split a merged bin back into per-track bins
+    #[arg(short = 's', long = "split")]
+    split: bool,
+
+    /// Output directory (default: same dir as cue file)
+    #[arg(short = 'o', long = "outdir")]
+    outdir: Option<String>,
+
+    /// Verbose output
+    #[arg(short = 'v', long = "verbose")]
+    verbose: bool,
+}
+
+// ──────────────────────── Timestamp helpers ──────────────────────────
+
+/// Convert "MM:SS:FF" → sectors (75 frames/s, 60s/min).
+fn cuestamp_to_sectors(stamp: &str) -> Result<u32, &'static str> {
+    let caps = CUESTAMP_RE.captures(stamp).ok_or("Invalid timestamp format")?;
+    let m: u32 = caps[1].parse().map_err(|_| "bad minutes")?;
+    let s: u32 = caps[2].parse().map_err(|_| "bad seconds")?;
+    let f: u32 = caps[3].parse().map_err(|_| "bad frames")?;
+    Ok(f + s * 75 + m * 60 * 75)
+}
+
+/// Convert sectors → "MM:SS:FF".
+fn sectors_to_cuestamp(sectors: u32) -> String {
+    let minutes = sectors / 4500;
+    let remainder = sectors % 4500;
+    let seconds = remainder / 75;
+    let frames = remainder % 75;
+    format!("{minutes:02}:{seconds:02}:{frames:02}")
+}
+
+// ──────────────────────── Blocksize ───────────────────────────────────
+
+/// Map track type string to byte blocksize.
+fn blocksize_for_type(track_type: &str) -> Option<u32> {
+    match track_type {
+        "AUDIO" | "MODE1/2352" | "MODE2/2352" | "CDI/2352" => Some(2352),
+        "CDG" => Some(2448),
+        "MODE1/2048" => Some(2048),
+        "MODE2/2336" | "CDI/2336" => Some(2336),
+        _ => None,
     }
 }
 
-fn cuestamp_to_sectors(timestamp: &str) -> Result<u32, &'static str> {
-    let start_cuestamp = Instant::now();
+// ──────────────────────── CUE parser ──────────────────────────────────
 
-    let duration_cuestamp = start_cuestamp.elapsed();
+/// Parse a .cue file into a list of BinFile structs.
+///
+/// Each FILE directive starts a new bin; TRACK and INDEX directives
+/// are associated with the most recent FILE.
+fn parse_cue(cue_path: &Path) -> io::Result<Vec<BinFile>> {
+    let cue_dir = cue_path.parent().unwrap_or(Path::new("."));
+    let file = File::open(cue_path)?;
+    let reader = io::BufReader::new(file);
 
-    if let Some(caps) = CUESTAMP_PATTERN.captures(&timestamp) {
-        let minutes = caps.get(1).ok_or("Invalid timestamp")?.as_str().parse::<u32>().map_err(|_| "Invalid minutes")?;
-        let seconds = caps.get(2).ok_or("Invalid timestamp")?.as_str().parse::<u32>().map_err(|_| "Invalid seconds")?;
-        let frames = caps.get(3).ok_or("Invalid timestamp")?.as_str().parse::<u32>().map_err(|_| "Invalid frames")?;
-        
-        println!("Time elapsed in cuestamp_to_sectors() is: {:?}", duration_cuestamp);
-        Ok(frames + (seconds * 75) + (minutes * 60 * 75))
-    } else {
-        Err("Timestamp does not match pattern")
-    }
-}
-
-fn print_bin_files(bin_files: &Vec<BinFile>) {
-    for bin_file in bin_files{
-        println!("-- File --");
-        println!("Filename: {}", bin_file.filename);
-        println!("Size: {} bytes", bin_file.size.unwrap_or(0));
-        println!("Tracks: {}", bin_file.tracks.len());
-
-        for track in &bin_file.tracks {
-            println!("-- Track --");
-            println!("Track number: {}", track.num);
-            println!("Track type: {}", track.track_type);
-            println!("Track indexes: {}", track.indexes.len());
-
-            for index in &track.indexes {
-                println!("-- Index --");
-                println!("Index id: {}", index.id);
-                println!("Index stamp: {}", index.stamp);
-                println!("Index file offset: {}", index.file_offset);
-            }
-        }
-    }
-}
-
-fn get_bin_from_cue(cue_path : &str) -> io::Result<Vec<BinFile>> {
     let mut bin_files: Vec<BinFile> = Vec::new();
 
-    let mut missing_bin_file = false;
-
-    let cue_file = File::open(cue_path)?;
-    let reader = io::BufReader::new(cue_file);
-
-    let start = Instant::now();
-
-    let mut current_file_index: Option<usize> = None;
-    let mut current_track_index: Option<usize> = None;
-    let mut current_index_index : Option<usize> = None;
-    
     for line in reader.lines() {
         let line = line?;
 
-        // Process file lines
-        if let Some(caps) = FILE_PATTERN.captures(&line) {
-            let start_bin_file = Instant::now();
-            
-            if let Some(bin) = caps.get(1) {
-                let bin_file_path = Path::new(cue_path).parent().unwrap().join(bin.as_str());
-                //let bin_file = File::open(bin_file_path);
-                //println!("Bin file: {}", bin_file_path.to_str().unwrap());
-                let current_bin_file = BinFile::new(bin_file_path).unwrap();
-                bin_files.push(current_bin_file);
-                current_file_index = Some(bin_files.len() - 1);
-                current_track_index = None;
-                current_index_index = None;
+        if let Some(caps) = FILE_RE.captures(&line) {
+            let name = caps
+                .get(1)
+                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "FILE regex matched but capture group missing"))?
+                .as_str();
+            let path = cue_dir.join(name);
 
-                let duration_bin_file = start_bin_file.elapsed();
-                println!("Time elapsed in BinFile::new() is: {:?}", duration_bin_file);
-
-                continue;
+            if !path.is_file() {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("Bin file not found: {}", path.display()),
+                ));
             }
+            let size = fs::metadata(&path)?.len();
+            bin_files.push(BinFile {
+                filename: name.to_string(),
+                tracks: Vec::new(),
+                size,
+            });
+            continue;
         }
-        // Process track lines
-        if let Some(caps) = TRACK_PATTERN.captures(&line) {
-            let start_track = Instant::now();
 
-            if let (Some(track_number_match), Some(track_type_match)) = (caps.get(1), caps.get(2)) {
-                let track_number = track_number_match.as_str().parse::<u32>().unwrap();
-                let track_type = track_type_match.as_str().to_string();
-
-                if let Some(file_index) = current_file_index {
-                    let current_track = Track::new(track_number, track_type);
-                    bin_files[file_index].tracks.push(current_track);
-                    current_track_index = Some(bin_files[file_index].tracks.len() - 1);
-                    current_index_index = None;
-                }
-
-                let duration_tracks = start_track.elapsed();
-                println!("Time elapsed in Track::new() is: {:?}", duration_tracks);
-
-                continue;
+        if let Some(caps) = TRACK_RE.captures(&line) {
+            if let Some(current) = bin_files.last_mut() {
+                let number: u32 = caps[1]
+                    .parse()
+                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("Invalid track number: {e}")))?;
+                let track_type = caps[2].to_string();
+                current.tracks.push(Track {
+                    number,
+                    track_type,
+                    indexes: Vec::new(),
+                    sectors: None,
+                });
             }
+            continue;
         }
-        // Process index lines
-        if let Some(caps) = INDEX_PATTERN.captures(&line) {
-            if let (Some(index_number_match), Some(timestamp_match)) = (caps.get(1), caps.get(2)) {
-                let index_number = index_number_match.as_str().parse::<u32>().unwrap();
-                let timestamp = timestamp_match.as_str().to_string();
-                //let start_index = Instant::now();
-                let file_offset = cuestamp_to_sectors(&timestamp).unwrap(); // Convert timestamp to sectors
-                //let duration_index = start_index.elapsed();
 
-                if let Some(file_index) = current_file_index {
-                    if let Some(track_index) = current_track_index {
-                        let current_index = Index::new(index_number, timestamp, file_offset);
-                        bin_files[file_index].tracks[track_index].indexes.push(current_index);
-                        current_index_index = Some(bin_files[file_index].tracks[track_index].indexes.len() - 1);
-                    }
+        if let Some(caps) = INDEX_RE.captures(&line) {
+            if let Some(current) = bin_files.last_mut() {
+                if let Some(track) = current.tracks.last_mut() {
+                    let number: u32 = caps[1]
+                        .parse()
+                        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("Invalid index number: {e}")))?;
+                    let file_offset = cuestamp_to_sectors(&caps[2])
+                        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+                    track.indexes.push(Index {
+                        number,
+                        file_offset,
+                    });
                 }
-                //println!("Time elapsed in Index::new() is: {:?}", duration_index);
-
-                continue;
             }
         }
     }
-    let duration = start.elapsed();
-    println!("Time elapsed in get_bin_from_cue() is: {:?}", duration);
 
-    // Check if bin file is missing
-    // if missing_bin_file {
-    //     eprintln!("Bin file is missing!");
-    //     return Ok(bin_files);
-    // }
+    if bin_files.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "No bin files found in cue sheet",
+        ));
+    }
 
     Ok(bin_files)
 }
 
-fn get_cd_from_cue(cue_path : &str) -> io::Result<rcue::cue::Cue> {
-    println!("Cue path: {}", cue_path);
-    match Path::new(cue_path).exists() {
-        true => println!("Cue file exists!"),
-        false => {
-            eprintln!("Cue file does not exist!");
-            //return Ok(CD::parse("".to_string()).unwrap());
-        }
-        
+// ──────────────────────── Sector calculation ──────────────────────────
+
+/// For a single-bin cue (split scenario), calculate each track's length
+/// in sectors by working backwards from the end of the file.
+fn calc_track_sectors(files: &mut [BinFile], blocksize: u32) -> io::Result<()> {
+    if files.len() != 1 {
+        return Ok(());
     }
-    let cd = parse_from_file(cue_path, true).unwrap();
-    println!("CD: {:?}", cd);
-    println!("CD Title: {:?}", cd.title);
+    let file = &mut files[0];
+    let total_sectors = (file.size / blocksize as u64) as u32;
+    let mut next_offset = total_sectors;
 
+    for track in file.tracks.iter_mut().rev() {
+        let first_index = track
+            .indexes
+            .first()
+            .map(|i| i.file_offset)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, format!("Track {} has no INDEX entries", track.number)))?;
+        track.sectors = Some(next_offset - first_index);
+        next_offset = first_index;
+    }
+    Ok(())
+}
+// ──────────────────────── CUE generation ──────────────────────────────
+fn gen_merged_cuesheet(basename: &str, files: &[BinFile], blocksize: u32) -> String {
+    let mut out = String::new();
+    out.push_str(&format!("FILE \"{basename}.bin\" BINARY\n"));
+    let mut sector_pos: u32 = 0;
 
-    // let cue_file = File::open(cue_path)?;
-    // // Read cue file and store it in a single string variable
-    // let mut cue_contents = String::new();
-    // let mut reader = io::BufReader::new(cue_file);
-    // reader.read_to_string(&mut cue_contents)?;
+    for file in files {
+        let file_sectors = (file.size / blocksize as u64) as u32;
+        for track in &file.tracks {
+            out.push_str(&format!("  TRACK {:02} {}\n", track.number, track.track_type));
+            for idx in &track.indexes {
+                let abs_offset = sector_pos + idx.file_offset;
+                out.push_str(&format!(
+                    "    INDEX {:02} {}\n",
+                    idx.number,
+                    sectors_to_cuestamp(abs_offset)
+                ));
+            }
+        }
+        sector_pos += file_sectors;
+    }
 
-    // let cd = CD::parse(cue_contents.to_string()).unwrap();
-
-    // println!("Number of tracks: {}", cd.get_track_count());
-    // let mode = match cd.get_mode() {
-    //     DiscMode::CD_DA => "CD-DA",
-    //     DiscMode::CD_ROM => "CD-ROM",
-    //     DiscMode::CD_ROM_XA => "CD-ROM XA",
-    // };
-    // println!("Mode: {}", mode);
-    // println!("");
-
-    // for (index, track) in cd.tracks().iter().enumerate() {
-    //     println!("Track {}", index + 1);
-    //     println!("Filename: {}", track.get_filename());
-    //     println!("Start: {}", track.get_start());
-    //     println!("Length: {:?}", track.get_length());
-    //     println!("Pregap: {:?}", track.get_zero_pre());
-    //     println!("Postgap: {:?}", track.get_zero_post());
-    //     println!("");
-    // }
-
-    Ok(cd)
+    out.replace('\n', "\r\n")
 }
 
-fn merge_files(merged_filename: &str, files: Vec<&str>) -> io::Result<bool> {
-    if Path::new(merged_filename).exists() {
-        eprintln!("Target merged bin path already exists: {}", merged_filename);
-        return Ok(false);
+/// Generate a split cue sheet: one FILE per track.
+fn gen_split_cuesheet(basename: &str, file: &BinFile) -> String {
+    let mut out = String::new();
+    let track_count = file.tracks.len();
+
+    for track in &file.tracks {
+        let track_fn = track_filename(basename, track.number, track_count);
+        out.push_str(&format!("FILE \"{track_fn}\" BINARY\n"));
+        // Safety: calc_track_sectors already verified every track has at least one INDEX.
+        // The unwrap_or(0) is defensive only.
+        let base_offset = track.indexes.first().map(|i| i.file_offset).unwrap_or(0);
+
+        for idx in &track.indexes {
+            let rel_offset = idx.file_offset - base_offset;
+            out.push_str(&format!(
+                "    INDEX {:02} {}\n",
+                idx.number,
+                sectors_to_cuestamp(rel_offset)
+            ));
+        }
     }
 
-    let mut outfile = OpenOptions::new().write(true).create_new(true).open(merged_filename)?;
+    out.replace('\n', "\r\n")
+}
 
-    let chunksize = 1024 * 1024;
-    for file in files {
-        let mut infile = File::open(file)?;
-        let mut buffer = vec![0; chunksize];
-        while let Ok(bytes_read) = infile.read(&mut buffer) {
-            if bytes_read == 0 {
+/// Redump-style track filename.
+fn track_filename(prefix: &str, track_num: u32, track_count: usize) -> String {
+    if track_count == 1 {
+        format!("{prefix}.bin")
+    } else if track_count > 9 {
+        format!("{prefix} (Track {track_num:02}).bin")
+    } else {
+        format!("{prefix} (Track {track_num}).bin")
+    }
+}
+
+// ──────────────────────── Merge / Split ───────────────────────────────
+
+/// Concatenate bin files into a single output file.
+fn merge_files(merged_path: &Path, files: &[BinFile], cue_dir: &Path) -> io::Result<()> {
+    if merged_path.exists() {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            format!("Output file already exists: {}", merged_path.display()),
+        ));
+    }
+
+    let mut outfile = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(merged_path)?;
+
+    // 1 MiB heap buffer
+    let mut buf = vec![0u8; BUF_SIZE];
+
+    for bin in files {
+        let bin_path = cue_dir.join(&bin.filename);
+        let mut infile = File::open(&bin_path)?;
+        loop {
+            let n = infile.read(&mut buf)?;
+            if n == 0 {
                 break;
             }
-            outfile.write_all(&buffer[..bytes_read])?;
+            outfile.write_all(&buf[..n])?;
         }
     }
-    Ok(true)
+
+    outfile.flush()?;
+    Ok(())
 }
 
-fn read_directory(file_list: &mut Vec<String>, dir: &Path) -> io::Result<bool> {
-    match fs::read_dir(dir) {
-        Err(e) => println!("There was an error reading the directory: {}", e),
-        Ok(paths) => {
-            for path in paths {
-                match path {
-                    Err(e) => println!("There was an error with one of the entries: {}", e),
-                    Ok(p) => if p.path().is_file() {
-                        let file_name = p.file_name().into_string().unwrap();
-                        file_list.push(file_name);
-                    }
-                }
+/// Split a merged bin file into per-track bin files.
+fn split_files(
+    merged_file: &BinFile,
+    cue_dir: &Path,
+    outdir: &Path,
+    basename: &str,
+    blocksize: u32,
+) -> io::Result<()> {
+    let merged_path = cue_dir.join(&merged_file.filename);
+    let mut infile = File::open(&merged_path)?;
+    let track_count = merged_file.tracks.len();
+
+    // Pre-check all output paths before any writes (all-or-nothing)
+    for track in &merged_file.tracks {
+        let out_name = track_filename(basename, track.number, track_count);
+        let out_path = outdir.join(&out_name);
+        if out_path.exists() {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!("Output file already exists: {}", out_path.display()),
+            ));
+        }
+    }
+    let mut buf = vec![0u8; BUF_SIZE];
+
+    for track in &merged_file.tracks {
+        let first_index = track
+            .indexes
+            .first()
+            .map(|i| i.file_offset)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, format!("Track {} has no INDEX entries", track.number)))?;
+        let sectors = track
+            .sectors
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, format!("Track {} has no sector length computed", track.number)))?;
+        let offset_bytes = first_index as u64 * blocksize as u64;
+        let length_bytes = sectors as u64 * blocksize as u64;
+
+        let out_name = track_filename(basename, track.number, track_count);
+        let out_path = outdir.join(&out_name);
+
+        let mut outfile = File::create(&out_path)?;
+
+        // Seek + copy exact byte range
+        infile.seek(std::io::SeekFrom::Start(offset_bytes))?;
+        let mut chunk = (&mut infile).take(length_bytes);
+        loop {
+            let n = chunk.read(&mut buf)?;
+            if n == 0 {
+                break;
             }
-        },
-    }
-    Ok(true)
-}
-
-fn files(dir: &Path) -> Result<Vec<PathBuf>, io::Error> {
-    Ok(fs::read_dir(dir)?
-        .into_iter()
-        .filter(|r| r.is_ok()) // Get rid of Err variants for Result<DirEntry>
-        .map(|r| r.unwrap().path()) // This is safe, since we only have the Ok variants
-        .filter(|r| r.is_file()) // Filter out non-files
-        .collect())
-}
-
-fn main() {
-    // ---- Read Cue File tests ----
-    let path = Path::new("D:\\Downloads\\binmergetests\\Mortal Kombat 3 (USA)");
-    // Find cue file by its extension
-    let start = Instant::now();
-    let cue_path = path.join(path.file_name().unwrap()).with_extension("cue");
-    let bin_files = get_bin_from_cue(cue_path.to_str().unwrap());
-    //let _ = get_cd_from_cue(cue_path.to_str().unwrap());
-    let duration = start.elapsed();
-
-    // Print bin files
-    match bin_files {
-        Ok(bin_files) => print_bin_files(&bin_files),
-        Err(e) => println!("Error: {}", e),
+            outfile.write_all(&buf[..n])?;
+        }
     }
 
-    println!("Time elapsed in files() is: {:?}", duration);
+    Ok(())
+}
 
-    // ---- Read Cue File tests ----
+fn info(msg: &str) {
+    println!("[INFO]\t{msg}");
+}
+
+fn fatal(msg: &str) -> ! {
+    eprintln!("[ERROR]\t{msg}");
+    std::process::exit(1);
+}
+
+fn debug(verbose: bool, msg: &str) {
+    if verbose {
+        println!("[DEBUG]\t{msg}");
+    }
+}
+
+// ──────────────────────── Main ────────────────────────────────────────
 
 
-    // ---- Merge Files tests ----
-    // Example usage
-    //let result = merge_files("output_file.bin", vec!["file1.bin", "file2.bin"]);
-    // ---- Merge Files tests ----
-    
-    
-    // ---- Directory Reading tests ----
-    // let start = Instant::now();
-    // let path = Path::new("D:\\Downloads\\GB");
-    // let result = files(path);
-    // println!("{} files added successfully!", result.unwrap().len());
-    // let duration = start.elapsed();
-    // println!("Time elapsed in files() is: {:?}", duration);
+fn write_cue_file(outdir: &Path, basename: &str, cuesheet: &str) -> io::Result<PathBuf> {
+    let path = outdir.join(format!("{basename}.cue"));
+    if path.exists() {
+        fatal(&format!("Output cue file already exists: {}", path.display()));
+    }
+    fs::write(&path, cuesheet)?;
+    Ok(path)
+}
+fn main() -> io::Result<()> {
+    let total_start = Instant::now();
+    let args = Args::parse();
 
+    // --- Resolve paths ---
+    let cue_path = Path::new(&args.cuefile)
+        .canonicalize()
+        .unwrap_or_else(|_| PathBuf::from(&args.cuefile));
 
-    // let start = Instant::now();
-    // let mut file_list: Vec<String> = Vec::new();
+    if !cue_path.is_file() {
+        fatal(&format!("Cue file not found or not a regular file: {}", cue_path.display()));
+    }
 
-    // let result = read_directory(&mut file_list, path);
+    let cue_dir = cue_path.parent().unwrap_or(Path::new("."));
 
-    // match result {
-    //     Ok(_) => {
-    //         println!("{} files added successfully!", file_list.len());
-    //         let duration = start.elapsed();
-    //         println!("Time elapsed in read_directory() is: {:?}", duration);
-    //     }
-    //     Err(e) => println!("Error listing files: {}", e),
-    // }
-    // ---- Directory Reading tests ----
-    
+    let outdir = match &args.outdir {
+        Some(d) => {
+            let p = PathBuf::from(d);
+            fs::create_dir_all(&p)?;
+            p
+        }
+        None => cue_dir.to_path_buf(),
+    };
+
+    // --- Parse CUE ---
+    info(&format!("Opening cue: {}", cue_path.display()));
+    let parse_start = Instant::now();
+    let mut bin_files = parse_cue(&cue_path)?;
+    let parse_ms = parse_start.elapsed().as_millis();
+    debug(args.verbose, &format!("Parsed {} file(s) in {parse_ms}ms", bin_files.len()));
+
+    // --- Determine blocksize ---
+    let blocksize = bin_files
+        .iter()
+        .find_map(|f| f.tracks.first())
+        .and_then(|t| blocksize_for_type(&t.track_type))
+        .unwrap_or(2352); // default for AUDIO/MODE2
+
+    debug(args.verbose, &format!("Blocksize: {blocksize} bytes/sector"));
+
+    // --- Single-file: compute track sectors ---
+    calc_track_sectors(&mut bin_files, blocksize)?;
+
+    // --- Merge or Split ---
+    if args.split {
+        if bin_files.len() != 1 {
+            fatal("Split mode requires a cue with exactly one FILE.");
+        }
+
+        let merged = &bin_files[0];
+        let track_count = merged.tracks.len();
+        info(&format!("Splitting {} tracks...", track_count));
+
+        split_files(merged, cue_dir, &outdir, &args.basename, blocksize)?;
+
+        let cuesheet = gen_split_cuesheet(&args.basename, merged);
+        let cue_out = write_cue_file(&outdir, &args.basename, &cuesheet)?;
+        info(&format!("Wrote {} tracks and cue: {}", track_count, cue_out.display()));
+    } else {
+        // Merge mode
+        let track_count: usize = bin_files.iter().map(|f| f.tracks.len()).sum();
+        info(&format!("Merging {} tracks...", track_count));
+
+        let merged_path = outdir.join(format!("{}.bin", args.basename));
+        merge_files(&merged_path, &bin_files, cue_dir)?;
+        info(&format!("Wrote {}", merged_path.display()));
+
+        let cuesheet = gen_merged_cuesheet(&args.basename, &bin_files, blocksize);
+        let cue_out = write_cue_file(&outdir, &args.basename, &cuesheet)?;
+        info(&format!("Wrote new cue: {}", cue_out.display()));
+    }
+
+    let total_ms = total_start.elapsed().as_millis();
+    debug(args.verbose, &format!("Total time: {total_ms}ms"));
+
+    Ok(())
 }
